@@ -41,6 +41,11 @@ jobs:
         run: |
           git clone --depth=1 -b ${{ inputs.KERNEL_BRANCH }} ${{ inputs.KERNEL_REPO }} kernel-source
 
+      - name: Patch Kernel Headers for Modern GCC
+        run: |
+          cd kernel-source
+          find include/ -type f -name "*.h" -exec sed -i 's/#if __has_attribute/#if defined(__has_attribute) \&\& __has_attribute/g' {} +
+
       - name: Install Toolchain & Dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y \
