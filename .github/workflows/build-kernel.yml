@@ -55,12 +55,16 @@ on:
         default: 'https://github.com/kdrag0n/proton-clang'
         type: string
 
+permissions:
+  contents: read
+
 defaults:
   run:
     shell: bash
 
 jobs:
   build:
+    # 22.04, not latest: Proton's old binutils can't read glibc 2.39's .relr.dyn on 24.04
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     # Inputs are passed through env vars and always quoted in scripts,
@@ -81,13 +85,17 @@ jobs:
         run: |
           case "$KERNEL_REPO" in https://*) ;; *) echo "KERNEL_REPO must be an https URL"; exit 1 ;; esac
           case "$CLANG_REPO"  in https://*) ;; *) echo "CLANG_REPO must be an https URL"; exit 1 ;; esac
+          [[ "$BOOT_BLOCK"   =~ ^/[A-Za-z0-9/_.-]+$ ]]   || { echo "BOOT_BLOCK has unexpected characters"; exit 1; }
+          [[ "$DEVICE_NAMES" =~ ^[A-Za-z0-9_,\ -]+$ ]]   || { echo "DEVICE_NAMES has unexpected characters"; exit 1; }
+          [[ "$DEFCONFIG"    =~ ^[A-Za-z0-9_.-]+$ ]]     || { echo "DEFCONFIG has unexpected characters"; exit 1; }
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
-            cpio lz4 zip curl git python3 python-is-python3 libtinfo5 ccache device-tree-compiler
+            cpio lz4 zip curl git python3 python-is-python3 libtinfo5 ccache \
+            device-tree-compiler
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
@@ -131,6 +139,10 @@ jobs:
           # KVM often breaks old trees
           ./scripts/config --file out/.config -d KVM -d KVM_ARM_HOST || true
 
+          # 32-bit compat vDSO link fails with the x86 host ld ("cannot represent machine arm").
+          # Only costs 32-bit apps the fast clock_gettime path.
+          ./scripts/config --file out/.config -d COMPAT_VDSO || true
+
           if [ "$ENABLE_KSU" = "true" ]; then
             # On 4.14, KPROBES depends on MODULES, and mojito_defconfig has MODULES off.
             ./scripts/config --file out/.config -e MODULES -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
@@ -150,6 +162,8 @@ jobs:
 
           make "${COMMON[@]}" olddefconfig
 
+          grep -q "^# CONFIG_COMPAT_VDSO is not set" out/.config || echo "::warning::COMPAT_VDSO is still enabled (vdso32 link may fail)"
+
           if [ "$ENABLE_KSU" = "true" ]; then
             for opt in KSU KPROBES KPROBE_EVENTS; do
               grep -q "^CONFIG_${opt}=y" out/.config || { echo "::error::CONFIG_${opt} did not stick after olddefconfig (a dependency is missing)"; exit 1; }
@@ -157,6 +171,10 @@ jobs:
           fi
 
       - name: Compile kernel
+        env:
+          # Kernel builds embed __DATE__/__TIME__; these let ccache actually hit
+          CCACHE_SLOPPINESS: time_macros
+          KBUILD_BUILD_TIMESTAMP: "Thu Jan  1 00:00:00 UTC 2026"
         run: |
           cd kernel-source
           source ../make_vars.sh
@@ -180,7 +198,8 @@ jobs:
           cd AnyKernel3
           rm -rf .git .github README.md LICENSE modules patch ramdisk
           cp "../$IMG" .
-          [ -f "../$BOOT/dtbo.img" ] && cp "../$BOOT/dtbo.img" . || true
+          HAVE_DTBO=0
+          if [ -f "../$BOOT/dtbo.img" ]; then cp "../$BOOT/dtbo.img" . && HAVE_DTBO=1; fi
           # Separate dtb only needed if the image does not embed it
           if [[ "$IMG" != *-dtb ]] && [ -f "../$BOOT/dts/dtb" ]; then cp "../$BOOT/dts/dtb" .; fi
 
@@ -211,6 +230,9 @@ jobs:
             echo ". tools/ak3-core.sh;"
             echo "split_boot;"
             echo "flash_boot;"
+            if [ "$HAVE_DTBO" = "1" ]; then
+              echo "flash_generic dtbo;"
+            fi
           } > anykernel.sh
 
           ZIP="Kernel-${KVER}-$(date +%Y%m%d-%H%M).zip"
@@ -230,10 +252,20 @@ jobs:
           if-no-files-found: warn
 
       - name: Send zip to Telegram
+        # A Telegram problem must not turn a good build red or trigger the failure message
+        continue-on-error: true
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then
+            echo "::notice::Telegram secrets not set, skipping upload"
+            exit 0
+          fi
+          if [ "$(stat -c%s "$ZIP_NAME")" -gt 50000000 ]; then
+            echo "::warning::Zip is over 50 MB, Telegram Bot API will reject it. Grab it from the artifacts."
+            exit 0
+          fi
           KVER=$(cat kernel_version.txt)
           CAPTION="✅ <b>Kernel build successful</b>
           • Repo: <code>${KERNEL_REPO}</code>
@@ -252,6 +284,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
+          [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || exit 0
           [ -f build.log ] && tail -n 40 build.log > fail_tail.txt || echo "No build log" > fail_tail.txt
           curl -sS -F chat_id="$TG_CHAT" -F caption="❌ Kernel build failed (last lines of log)" \
             -F document=@fail_tail.txt "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" || true
