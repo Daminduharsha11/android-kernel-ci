@@ -3,7 +3,6 @@ name: Kernel Builder
 on:
   workflow_dispatch:
     inputs:
-      # ---------- Source ----------
       KERNEL_REPO:
         description: 'Kernel git repo (https)'
         required: true
@@ -25,8 +24,6 @@ on:
         default: 'arm64'
         type: choice
         options: [arm64, arm]
-
-      # ---------- Config ----------
       DEFCONFIG:
         description: 'Defconfig inside arch/<ARCH>/configs/ (can include a subdir, e.g. vendor/foo_defconfig)'
         required: true
@@ -63,8 +60,6 @@ on:
         required: true
         default: 'v0.9.5'
         type: string
-
-      # ---------- Toolchain ----------
       CLANG_REPO:
         description: 'Clang repo, optionally with #branch (e.g. https://...proton-clang#master). Empty = build with GCC'
         required: false
@@ -91,8 +86,6 @@ on:
         default: 'ubuntu-22.04'
         type: choice
         options: [ubuntu-22.04, ubuntu-24.04]
-
-      # ---------- Packaging ----------
       DEVICE_NAMES:
         description: 'Device codenames for the zip check, comma separated (empty = no device check)'
         required: false
@@ -126,8 +119,6 @@ jobs:
   build:
     runs-on: ${{ inputs.RUNNER }}
     timeout-minutes: 120
-    # Inputs are passed through env vars and always quoted in scripts,
-    # never pasted directly into shell code (prevents script injection).
     env:
       KERNEL_REPO: ${{ inputs.KERNEL_REPO }}
       KERNEL_BRANCH: ${{ inputs.KERNEL_BRANCH }}
@@ -148,6 +139,7 @@ jobs:
       BOOT_BLOCK: ${{ inputs.BOOT_BLOCK }}
       IS_SLOT_DEVICE: ${{ inputs.IS_SLOT_DEVICE }}
       FLASH_DTBO: ${{ inputs.FLASH_DTBO }}
+
     steps:
       - name: Validate inputs
         run: |
@@ -177,7 +169,6 @@ jobs:
             build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
             cpio lz4 zip curl git python3 python-is-python3 ccache device-tree-compiler \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
-          # Proton-era clang wants libtinfo5; it does not exist on 24.04, so don't fail on it
           sudo apt-get install -y --no-install-recommends libtinfo5 || echo "libtinfo5 not available, continuing"
 
       - name: Set up ccache
@@ -195,7 +186,6 @@ jobs:
       - name: Clone kernel source
         run: |
           if [[ "$KERNEL_BRANCH" =~ ^[0-9a-f]{7,40}$ ]]; then
-            # commit SHA: shallow fetch it directly
             git init kernel-source
             git -C kernel-source remote add origin "$KERNEL_REPO"
             git -C kernel-source fetch --depth=1 origin "$KERNEL_BRANCH"
@@ -230,16 +220,19 @@ jobs:
             echo "No CLANG_REPO set, building with GCC"
             echo "USE_CLANG=0" >> "$GITHUB_ENV"
           fi
+
           if [ -n "$GCC64_REPO" ]; then
             clone_tc gcc64 "$GCC64_REPO"
             p="$(find_prefix gcc64)"
             [ -n "$p" ] && CROSS64="$p" || echo "::warning::could not detect GCC64 prefix, using $CROSS64"
           fi
+
           if [ -n "$GCC32_REPO" ]; then
             clone_tc gcc32 "$GCC32_REPO"
             p="$(find_prefix gcc32)"
             [ -n "$p" ] && CROSS32="$p" || echo "::warning::could not detect GCC32 prefix, using $CROSS32"
           fi
+
           echo "CROSS64=$CROSS64" >> "$GITHUB_ENV"
           echo "CROSS32=$CROSS32" >> "$GITHUB_ENV"
 
@@ -259,8 +252,8 @@ jobs:
 
           if [ "$USE_CLANG" = "1" ]; then
             COMMON=(O=out ARCH="$ARCH" SUBARCH="$ARCH" CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-                    OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-                    CLANG_TRIPLE="$CROSS_MAIN" CROSS_COMPILE="$CROSS_MAIN" CROSS_COMPILE_ARM32="$CROSS32")
+                                OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+                                CLANG_TRIPLE="$CROSS_MAIN" CROSS_COMPILE="$CROSS_MAIN" CROSS_COMPILE_ARM32="$CROSS32")
             CCWRAP="ccache clang"
           else
             COMMON=(O=out ARCH="$ARCH" SUBARCH="$ARCH" CROSS_COMPILE="$CROSS_MAIN" CROSS_COMPILE_ARM32="$CROSS32")
@@ -270,15 +263,14 @@ jobs:
           read -ra EXTRA <<< "$EXTRA_MAKE_ARGS"
           declare -p COMMON EXTRA CCWRAP > ../make_vars.sh
 
-          # Defconfig must exist, otherwise list what is available
           if [ ! -f "arch/$ARCH/configs/$DEFCONFIG" ]; then
             echo "::error::arch/$ARCH/configs/$DEFCONFIG not found. Available:"
             find "arch/$ARCH/configs" -name '*defconfig' | sed "s|arch/$ARCH/configs/||" | sort | head -80
             exit 1
           fi
-          make "${COMMON[@]}" "$DEFCONFIG"
 
-          # Merge extra fragments
+          yes "" | make "${COMMON[@]}" "$DEFCONFIG"
+
           if [ -n "$EXTRA_FRAGMENTS" ]; then
             FRAGS=()
             for f in $EXTRA_FRAGMENTS; do
@@ -289,12 +281,10 @@ jobs:
             KCONFIG_CONFIG=out/.config ./scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
           fi
 
-          # User forced options
           for o in $CONFIG_DISABLE; do ./scripts/config --file out/.config -d "${o#CONFIG_}" || true; done
           for o in $CONFIG_ENABLE;  do ./scripts/config --file out/.config -e "${o#CONFIG_}" || true; done
 
           if [ "$ENABLE_KSU" = "true" ]; then
-            # On 4.14, KPROBES depends on MODULES, and many defconfigs have MODULES off.
             ./scripts/config --file out/.config -e MODULES -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
           else
             ./scripts/config --file out/.config -d KSU || true
@@ -314,13 +304,13 @@ jobs:
             *) : ;;
           esac
 
-          make "${COMMON[@]}" olddefconfig
+          yes "" | make "${COMMON[@]}" olddefconfig
 
-          # Report options that did not survive olddefconfig (missing dependency etc.)
           for o in $CONFIG_ENABLE; do
             o="${o#CONFIG_}"
             grep -Eq "^CONFIG_${o}=[ym]" out/.config || echo "::warning::CONFIG_${o} did not stick after olddefconfig"
           done
+
           if [ "$ENABLE_KSU" = "true" ]; then
             for opt in KSU KPROBES KPROBE_EVENTS; do
               grep -q "^CONFIG_${opt}=y" out/.config || { echo "::error::CONFIG_${opt} did not stick after olddefconfig (a dependency is missing)"; exit 1; }
@@ -329,7 +319,6 @@ jobs:
 
       - name: Compile kernel
         env:
-          # Kernel builds embed __DATE__/__TIME__; these let ccache actually hit
           CCACHE_SLOPPINESS: time_macros
           KBUILD_BUILD_TIMESTAMP: "Thu Jan  1 00:00:00 UTC 2026"
         run: |
@@ -360,7 +349,7 @@ jobs:
             if [ -f "../$BOOT/dtbo.img" ]; then cp "../$BOOT/dtbo.img" . && HAVE_DTBO=1
             else echo "::warning::FLASH_DTBO set but the tree did not build dtbo.img"; fi
           fi
-          # Separate dtb only needed if the image does not embed it
+
           if [[ "$IMG" != *-dtb ]] && [ -f "../$BOOT/dts/dtb" ]; then cp "../$BOOT/dts/dtb" .; fi
 
           KVER=$(cat ../kernel_version.txt)
@@ -375,14 +364,14 @@ jobs:
             echo "do.systemless=0"
             echo "do.cleanup=1"
             echo "do.cleanuponabort=0"
-            i=1
-            IFS=',' read -ra DEVS <<< "$DEVICE_NAMES"
-            for d in "${DEVS[@]}"; do
-              d="$(echo "$d" | xargs)"
-              [ -n "$d" ] || continue
-              echo "device.name$i=$d"
-              i=$((i+1))
-            done
+            if [ "$DEVCHECK" = "1" ]; then
+              i=1
+              IFS=',' read -ra DEVS <<< "$DEVICE_NAMES"
+              for d in "${DEVS[@]}"; do
+                echo "device.name$i=$(echo "$d" | xargs)"
+                i=$((i+1))
+              done
+            fi
             echo "supported.versions="
             echo "supported.patchlevels="
             echo "supported.vendorpatchlevels="
@@ -394,9 +383,6 @@ jobs:
             echo ". tools/ak3-core.sh;"
             echo "split_boot;"
             echo "flash_boot;"
-            if [ "$HAVE_DTBO" = "1" ]; then
-              echo "flash_generic dtbo;"
-            fi
           } > anykernel.sh
 
           ZIP="Kernel-${KVER}-$(date +%Y%m%d-%H%M).zip"
@@ -408,7 +394,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: kernel-build
-          include-hidden-files: true
           path: |
             *.zip
             build.log
@@ -416,8 +401,6 @@ jobs:
           if-no-files-found: warn
 
       - name: Send zip to Telegram
-        # A Telegram problem must not turn a good build red or trigger the failure message
-        continue-on-error: true
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -434,14 +417,22 @@ jobs:
           CAPTION="✅ <b>Kernel build successful</b>
           • Repo: <code>${KERNEL_REPO}</code>
           • Branch: <code>${KERNEL_BRANCH}</code>
-          • Arch: <code>${ARCH}</code>
           • Defconfig: <code>${DEFCONFIG}</code>
           • Version: <code>${KVER}</code>
           • KernelSU: <code>${ENABLE_KSU}</code>
           • LTO: <code>${LTO}</code>"
-          curl -sS --fail -F chat_id="$TG_CHAT" -F parse_mode=HTML \
+
+          RESPONSE=$(curl -sS -F chat_id="$TG_CHAT" -F parse_mode=HTML \
             -F caption="$CAPTION" -F document=@"$ZIP_NAME" \
-            "https://api.telegram.org/bot${TG_TOKEN}/sendDocument"
+            "https://api.telegram.org/bot${TG_TOKEN}/sendDocument")
+
+          echo "Telegram API Response: $RESPONSE"
+          if echo "$RESPONSE" | grep -q '"ok":true'; then
+            echo "Successfully sent zip to Telegram!"
+          else
+            echo "Failed to send zip to Telegram."
+            exit 1
+          fi
 
       - name: Notify failure on Telegram
         if: failure()
@@ -449,7 +440,7 @@ jobs:
           TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || exit 0
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then exit 0; fi
           [ -f build.log ] && tail -n 40 build.log > fail_tail.txt || echo "No build log" > fail_tail.txt
           curl -sS -F chat_id="$TG_CHAT" -F caption="❌ Kernel build failed (last lines of log)" \
             -F document=@fail_tail.txt "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" || true
