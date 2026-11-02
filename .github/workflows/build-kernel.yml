@@ -34,7 +34,7 @@ jobs:
       - name: Checkout AnyKernel3 Zipper
         uses: actions/checkout@v4
         with:
-          repository: AnonymousWP/AnyKernel3
+          repository: osm0sis/AnyKernel3
           path: AnyKernel3
 
       - name: Clone Dynamic Kernel Source
