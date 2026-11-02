@@ -1,0 +1,105 @@
+name: Dynamic Kernel Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      KERNEL_REPO:
+        description: 'Git repository URL of the kernel'
+        required: true
+      KERNEL_BRANCH:
+        description: 'Branch to checkout'
+        required: true
+        default: 'main'
+      DEFCONFIG:
+        description: 'Defconfig name'
+        required: true
+      ENABLE_KSU:
+        description: 'Enable KernelSU flag (true/false)'
+        required: false
+        default: 'false'
+      ENABLE_LTO:
+        description: 'Enable LTO flag (true/false)'
+        required: false
+        default: 'true'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout AnyKernel3
+        uses: actions/checkout@v4
+        with:
+          repository: AnonymousWP/AnyKernel3
+          path: AnyKernel3
+
+      - name: Clone Dynamic Kernel Source
+        run: |
+          git clone --depth=1 -b ${{ github.event.inputs.KERNEL_BRANCH }} ${{ github.event.inputs.KERNEL_REPO }} kernel-source
+
+      - name: Install Build Toolchain & Dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y \
+            build-essential libncurses-dev bison flex libssl-dev bc git wget zip
+          git clone --depth=1 https://github.com/llvm/llvm-project.git toolchain/llvm
+
+      - name: Process Flags & Compile Kernel
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          KBUILD_BUILD_USER: "Automation"
+          KBUILD_BUILD_HOST: "GitHubActions"
+        run: |
+          export PATH="${{ github.workspace }}/toolchain/llvm/bin:$PATH"
+          cd kernel-source
+          mkdir -p out
+
+          # Apply Defconfig
+          make O=out CC=clang ${{ github.event.inputs.DEFCONFIG }}
+
+          # Toggle Config Flags dynamically
+          if [ "${{ github.event.inputs.ENABLE_KSU }}" = "true" ]; then
+            echo "Enabling KernelSU..."
+            ./scripts/config --file out/.config -e CONFIG_KSU
+          else
+            ./scripts/config --file out/.config -d CONFIG_KSU
+          fi
+
+          if [ "${{ github.event.inputs.ENABLE_LTO }}" = "false" ]; then
+            echo "Disabling LTO..."
+            ./scripts/config --file out/.config -d CONFIG_THINLTO -d CONFIG_LTO_CLANG
+          fi
+
+          # Update config state
+          make O=out CC=clang olddefconfig
+
+          # Compile
+          make -j$(nproc) O=out \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu-
+
+      - name: Package with AnyKernel3
+        run: |
+          # Find image format
+          IMG=$(find kernel-source/out/arch/arm64/boot/ -name "Image*" -type f | head -n 1)
+          if [ -z "$IMG" ]; then
+            echo "Error: No compiled image found!"
+            exit 1
+          fi
+
+          cp "$IMG" AnyKernel3/
+          cd AnyKernel3
+          zip -r9 ../flashable-kernel.zip *
+
+      - name: Send Zip to Telegram
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          document: flashable-kernel.zip
+          caption: |
+            ✅ *Build Complete!*
+            • Source: `${{ github.event.inputs.KERNEL_REPO }}`
+            • Branch: `${{ github.event.inputs.KERNEL_BRANCH }}`
+            • Defconfig: `${{ github.event.inputs.DEFCONFIG }}`
+            • KernelSU: `${{ github.event.inputs.ENABLE_KSU }}`
