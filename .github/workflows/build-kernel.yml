@@ -44,7 +44,8 @@ jobs:
       - name: Install Toolchain & Dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y \
-            build-essential libncurses-dev bison flex libssl-dev bc git wget zip
+            build-essential libncurses-dev bison flex libssl-dev bc git wget zip \
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
           git clone --depth=1 https://github.com/llvm/llvm-project.git toolchain/llvm
 
       - name: Compile Kernel & Apply Flags
