@@ -3,37 +3,56 @@ name: Kernel Builder
 on:
   workflow_dispatch:
     inputs:
+      # ---------- Source ----------
       KERNEL_REPO:
-        description: 'Kernel Git Repository URL (https)'
+        description: 'Kernel git repo (https)'
         required: true
         default: 'https://github.com/ximi-mojito/android_kernel_xiaomi_mojito'
         type: string
       KERNEL_BRANCH:
-        description: 'Branch to checkout'
+        description: 'Branch, tag or commit SHA'
         required: true
         default: '17.0'
         type: string
+      SUBMODULES:
+        description: 'Fetch git submodules (some trees keep drivers/techpack in submodules)'
+        required: true
+        default: false
+        type: boolean
+      ARCH:
+        description: 'Kernel architecture'
+        required: true
+        default: 'arm64'
+        type: choice
+        options: [arm64, arm]
+
+      # ---------- Config ----------
       DEFCONFIG:
-        description: 'Defconfig name (NOT plain "defconfig", that is generic upstream arm64)'
+        description: 'Defconfig inside arch/<ARCH>/configs/ (can include a subdir, e.g. vendor/foo_defconfig)'
         required: true
         default: 'mojito_defconfig'
         type: string
-      DEVICE_NAMES:
-        description: 'Device codenames for the zip check, comma separated'
-        required: true
-        default: 'mojito,sunny'
+      EXTRA_FRAGMENTS:
+        description: 'Extra config fragments to merge, space separated (path from kernel root or from arch/<ARCH>/configs/)'
+        required: false
+        default: ''
         type: string
-      BOOT_BLOCK:
-        description: 'Boot partition block (e.g. /dev/block/bootdevice/by-name/boot)'
-        required: true
-        default: '/dev/block/bootdevice/by-name/boot'
+      CONFIG_ENABLE:
+        description: 'Options to force on, space separated, without CONFIG_ prefix'
+        required: false
+        default: ''
         type: string
-      IS_SLOT_DEVICE:
-        description: 'A/B device? (auto / 0 / 1)'
+      CONFIG_DISABLE:
+        description: 'Options to force off, space separated, without CONFIG_ prefix'
+        required: false
+        default: 'KVM KVM_ARM_HOST COMPAT_VDSO'
+        type: string
+      LTO:
+        description: 'ThinLTO: default = leave defconfig alone, on = force, off = disable (clang only)'
         required: true
-        default: '0'
+        default: 'default'
         type: choice
-        options: [auto, '0', '1']
+        options: [default, 'on', 'off']
       ENABLE_KSU:
         description: 'Enable KernelSU (non-GKI setup)'
         required: true
@@ -44,16 +63,57 @@ on:
         required: true
         default: 'v0.9.5'
         type: string
-      ENABLE_LTO:
-        description: 'Enable ThinLTO (mojito_defconfig already has LTO+CFI on)'
-        required: true
-        default: true
-        type: boolean
+
+      # ---------- Toolchain ----------
       CLANG_REPO:
-        description: 'Clang toolchain git repo (must include binutils, e.g. proton-clang)'
-        required: true
+        description: 'Clang repo, optionally with #branch (e.g. https://...proton-clang#master). Empty = build with GCC'
+        required: false
         default: 'https://github.com/kdrag0n/proton-clang'
         type: string
+      GCC64_REPO:
+        description: 'Optional 64-bit GCC/binutils repo, optionally #branch. Empty = use Ubuntu aarch64-linux-gnu-'
+        required: false
+        default: ''
+        type: string
+      GCC32_REPO:
+        description: 'Optional 32-bit GCC/binutils repo, optionally #branch. Empty = use Ubuntu arm-linux-gnueabi-'
+        required: false
+        default: ''
+        type: string
+      EXTRA_MAKE_ARGS:
+        description: 'Extra make arguments, space separated (e.g. LLVM=1 LLVM_IAS=1)'
+        required: false
+        default: ''
+        type: string
+      RUNNER:
+        description: 'GitHub runner image (22.04 for old toolchains like Proton, 24.04 for newer ones)'
+        required: true
+        default: 'ubuntu-22.04'
+        type: choice
+        options: [ubuntu-22.04, ubuntu-24.04]
+
+      # ---------- Packaging ----------
+      DEVICE_NAMES:
+        description: 'Device codenames for the zip check, comma separated (empty = no device check)'
+        required: false
+        default: 'mojito,sunny'
+        type: string
+      BOOT_BLOCK:
+        description: 'Boot partition block'
+        required: true
+        default: '/dev/block/bootdevice/by-name/boot'
+        type: string
+      IS_SLOT_DEVICE:
+        description: 'A/B device? (auto / 0 / 1)'
+        required: true
+        default: '0'
+        type: choice
+        options: [auto, '0', '1']
+      FLASH_DTBO:
+        description: 'Also flash the kernel-built dtbo.img (only if the tree builds one)'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -64,43 +124,66 @@ defaults:
 
 jobs:
   build:
-    # 22.04, not latest: Proton's old binutils can't read glibc 2.39's .relr.dyn on 24.04
-    runs-on: ubuntu-22.04
+    runs-on: ${{ inputs.RUNNER }}
     timeout-minutes: 120
     # Inputs are passed through env vars and always quoted in scripts,
     # never pasted directly into shell code (prevents script injection).
     env:
       KERNEL_REPO: ${{ inputs.KERNEL_REPO }}
       KERNEL_BRANCH: ${{ inputs.KERNEL_BRANCH }}
+      SUBMODULES: ${{ inputs.SUBMODULES }}
+      ARCH: ${{ inputs.ARCH }}
       DEFCONFIG: ${{ inputs.DEFCONFIG }}
+      EXTRA_FRAGMENTS: ${{ inputs.EXTRA_FRAGMENTS }}
+      CONFIG_ENABLE: ${{ inputs.CONFIG_ENABLE }}
+      CONFIG_DISABLE: ${{ inputs.CONFIG_DISABLE }}
+      LTO: ${{ inputs.LTO }}
+      ENABLE_KSU: ${{ inputs.ENABLE_KSU }}
+      KSU_REF: ${{ inputs.KSU_REF }}
+      CLANG_REPO: ${{ inputs.CLANG_REPO }}
+      GCC64_REPO: ${{ inputs.GCC64_REPO }}
+      GCC32_REPO: ${{ inputs.GCC32_REPO }}
+      EXTRA_MAKE_ARGS: ${{ inputs.EXTRA_MAKE_ARGS }}
       DEVICE_NAMES: ${{ inputs.DEVICE_NAMES }}
       BOOT_BLOCK: ${{ inputs.BOOT_BLOCK }}
       IS_SLOT_DEVICE: ${{ inputs.IS_SLOT_DEVICE }}
-      ENABLE_KSU: ${{ inputs.ENABLE_KSU }}
-      KSU_REF: ${{ inputs.KSU_REF }}
-      ENABLE_LTO: ${{ inputs.ENABLE_LTO }}
-      CLANG_REPO: ${{ inputs.CLANG_REPO }}
+      FLASH_DTBO: ${{ inputs.FLASH_DTBO }}
     steps:
       - name: Validate inputs
         run: |
-          case "$KERNEL_REPO" in https://*) ;; *) echo "KERNEL_REPO must be an https URL"; exit 1 ;; esac
-          case "$CLANG_REPO"  in https://*) ;; *) echo "CLANG_REPO must be an https URL"; exit 1 ;; esac
-          [[ "$BOOT_BLOCK"   =~ ^/[A-Za-z0-9/_.-]+$ ]]   || { echo "BOOT_BLOCK has unexpected characters"; exit 1; }
-          [[ "$DEVICE_NAMES" =~ ^[A-Za-z0-9_,\ -]+$ ]]   || { echo "DEVICE_NAMES has unexpected characters"; exit 1; }
-          [[ "$DEFCONFIG"    =~ ^[A-Za-z0-9_.-]+$ ]]     || { echo "DEFCONFIG has unexpected characters"; exit 1; }
+          chk() { # name value regex
+            local re="$3"
+            [[ "$2" =~ $re ]] || { echo "::error::$1 has unexpected characters"; exit 1; }
+          }
+          for v in KERNEL_REPO CLANG_REPO GCC64_REPO GCC32_REPO; do
+            val="${!v}"
+            [ -z "$val" ] && continue
+            case "$val" in https://*) ;; *) echo "::error::$v must be an https URL"; exit 1 ;; esac
+          done
+          chk KERNEL_BRANCH   "$KERNEL_BRANCH"   '^[A-Za-z0-9._/@+-]+$'
+          chk DEFCONFIG       "$DEFCONFIG"       '^[A-Za-z0-9_./-]+$'
+          chk EXTRA_FRAGMENTS "$EXTRA_FRAGMENTS" '^[A-Za-z0-9_./ -]*$'
+          chk CONFIG_ENABLE   "$CONFIG_ENABLE"   '^[A-Za-z0-9_ ]*$'
+          chk CONFIG_DISABLE  "$CONFIG_DISABLE"  '^[A-Za-z0-9_ ]*$'
+          chk EXTRA_MAKE_ARGS "$EXTRA_MAKE_ARGS" '^[A-Za-z0-9_=./:+, -]*$'
+          chk KSU_REF         "$KSU_REF"         '^[A-Za-z0-9._/@+-]+$'
+          chk BOOT_BLOCK      "$BOOT_BLOCK"      '^/[A-Za-z0-9/_.-]+$'
+          chk DEVICE_NAMES    "$DEVICE_NAMES"    '^[A-Za-z0-9_, -]*$'
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
-            cpio lz4 zip curl git python3 python-is-python3 libtinfo5 ccache \
-            device-tree-compiler
+            cpio lz4 zip curl git python3 python-is-python3 ccache device-tree-compiler \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+          # Proton-era clang wants libtinfo5; it does not exist on 24.04, so don't fail on it
+          sudo apt-get install -y --no-install-recommends libtinfo5 || echo "libtinfo5 not available, continuing"
 
       - name: Set up ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: kernel-${{ inputs.DEFCONFIG }}
+          key: kernel-${{ inputs.ARCH }}
           max-size: 2G
 
       - name: Checkout AnyKernel3
@@ -110,12 +193,55 @@ jobs:
           path: AnyKernel3
 
       - name: Clone kernel source
-        run: git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel-source
-
-      - name: Clone Clang toolchain
         run: |
-          git clone --depth=1 "$CLANG_REPO" clang
-          echo "$PWD/clang/bin" >> "$GITHUB_PATH"
+          if [[ "$KERNEL_BRANCH" =~ ^[0-9a-f]{7,40}$ ]]; then
+            # commit SHA: shallow fetch it directly
+            git init kernel-source
+            git -C kernel-source remote add origin "$KERNEL_REPO"
+            git -C kernel-source fetch --depth=1 origin "$KERNEL_BRANCH"
+            git -C kernel-source checkout FETCH_HEAD
+          else
+            git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel-source
+          fi
+          if [ "$SUBMODULES" = "true" ]; then
+            git -C kernel-source submodule update --init --recursive --depth=1
+          fi
+          test -d "kernel-source/arch/$ARCH" || { echo "::error::arch/$ARCH not found, wrong ARCH for this tree?"; exit 1; }
+
+      - name: Clone toolchains
+        run: |
+          clone_tc() { # dir spec(url[#branch])
+            local dir="$1" spec="$2" url br=""
+            url="${spec%%#*}"
+            [[ "$spec" == *#* ]] && br="${spec#*#}"
+            if [ -n "$br" ]; then git clone --depth=1 -b "$br" "$url" "$dir"
+            else git clone --depth=1 "$url" "$dir"; fi
+            echo "$PWD/$dir/bin" >> "$GITHUB_PATH"
+          }
+          find_prefix() { ls "$1/bin" 2>/dev/null | grep -m1 -- '-gcc$' | sed 's/gcc$//' || true; }
+
+          CROSS64="aarch64-linux-gnu-"
+          CROSS32="arm-linux-gnueabi-"
+
+          if [ -n "$CLANG_REPO" ]; then
+            clone_tc clang "$CLANG_REPO"
+            echo "USE_CLANG=1" >> "$GITHUB_ENV"
+          else
+            echo "No CLANG_REPO set, building with GCC"
+            echo "USE_CLANG=0" >> "$GITHUB_ENV"
+          fi
+          if [ -n "$GCC64_REPO" ]; then
+            clone_tc gcc64 "$GCC64_REPO"
+            p="$(find_prefix gcc64)"
+            [ -n "$p" ] && CROSS64="$p" || echo "::warning::could not detect GCC64 prefix, using $CROSS64"
+          fi
+          if [ -n "$GCC32_REPO" ]; then
+            clone_tc gcc32 "$GCC32_REPO"
+            p="$(find_prefix gcc32)"
+            [ -n "$p" ] && CROSS32="$p" || echo "::warning::could not detect GCC32 prefix, using $CROSS32"
+          fi
+          echo "CROSS64=$CROSS64" >> "$GITHUB_ENV"
+          echo "CROSS32=$CROSS32" >> "$GITHUB_ENV"
 
       - name: Integrate KernelSU
         if: ${{ inputs.ENABLE_KSU }}
@@ -128,42 +254,73 @@ jobs:
         run: |
           cd kernel-source
           mkdir -p out
-          COMMON=(O=out ARCH=arm64 SUBARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
-                  OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
-                  CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
-                  CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
-          declare -p COMMON > ../make_vars.sh
 
+          if [ "$ARCH" = "arm64" ]; then CROSS_MAIN="$CROSS64"; else CROSS_MAIN="$CROSS32"; fi
+
+          if [ "$USE_CLANG" = "1" ]; then
+            COMMON=(O=out ARCH="$ARCH" SUBARCH="$ARCH" CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+                    OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+                    CLANG_TRIPLE="$CROSS_MAIN" CROSS_COMPILE="$CROSS_MAIN" CROSS_COMPILE_ARM32="$CROSS32")
+            CCWRAP="ccache clang"
+          else
+            COMMON=(O=out ARCH="$ARCH" SUBARCH="$ARCH" CROSS_COMPILE="$CROSS_MAIN" CROSS_COMPILE_ARM32="$CROSS32")
+            CCWRAP="ccache ${CROSS_MAIN}gcc"
+          fi
+          EXTRA=()
+          read -ra EXTRA <<< "$EXTRA_MAKE_ARGS"
+          declare -p COMMON EXTRA CCWRAP > ../make_vars.sh
+
+          # Defconfig must exist, otherwise list what is available
+          if [ ! -f "arch/$ARCH/configs/$DEFCONFIG" ]; then
+            echo "::error::arch/$ARCH/configs/$DEFCONFIG not found. Available:"
+            find "arch/$ARCH/configs" -name '*defconfig' | sed "s|arch/$ARCH/configs/||" | sort | head -80
+            exit 1
+          fi
           make "${COMMON[@]}" "$DEFCONFIG"
 
-          # KVM often breaks old trees
-          ./scripts/config --file out/.config -d KVM -d KVM_ARM_HOST || true
+          # Merge extra fragments
+          if [ -n "$EXTRA_FRAGMENTS" ]; then
+            FRAGS=()
+            for f in $EXTRA_FRAGMENTS; do
+              if   [ -f "$f" ]; then FRAGS+=("$f")
+              elif [ -f "arch/$ARCH/configs/$f" ]; then FRAGS+=("arch/$ARCH/configs/$f")
+              else echo "::error::fragment $f not found"; exit 1; fi
+            done
+            KCONFIG_CONFIG=out/.config ./scripts/kconfig/merge_config.sh -m -O out out/.config "${FRAGS[@]}"
+          fi
 
-          # 32-bit compat vDSO link fails with the x86 host ld ("cannot represent machine arm").
-          # Only costs 32-bit apps the fast clock_gettime path.
-          ./scripts/config --file out/.config -d COMPAT_VDSO || true
+          # User forced options
+          for o in $CONFIG_DISABLE; do ./scripts/config --file out/.config -d "${o#CONFIG_}" || true; done
+          for o in $CONFIG_ENABLE;  do ./scripts/config --file out/.config -e "${o#CONFIG_}" || true; done
 
           if [ "$ENABLE_KSU" = "true" ]; then
-            # On 4.14, KPROBES depends on MODULES, and mojito_defconfig has MODULES off.
+            # On 4.14, KPROBES depends on MODULES, and many defconfigs have MODULES off.
             ./scripts/config --file out/.config -e MODULES -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
           else
             ./scripts/config --file out/.config -d KSU || true
           fi
 
-          if [ "$ENABLE_LTO" = "true" ]; then
-            if grep -rqs "config LTO_CLANG" arch init Kconfig* 2>/dev/null; then
-              ./scripts/config --file out/.config -e LTO_CLANG -e THINLTO || true
-            else
-              echo "::warning::This tree has no LTO_CLANG option, skipping LTO"
-            fi
-          else
-            ./scripts/config --file out/.config -d LTO_CLANG -d THINLTO -d LTO || true
-          fi
+          case "$LTO" in
+            on)
+              if [ "$USE_CLANG" != "1" ]; then
+                echo "::warning::LTO requested but building with GCC, skipping"
+              elif grep -rqs "config LTO_CLANG" arch init Kconfig* 2>/dev/null; then
+                ./scripts/config --file out/.config -e LTO_CLANG -e THINLTO || true
+              else
+                echo "::warning::This tree has no LTO_CLANG option, skipping LTO"
+              fi ;;
+            off)
+              ./scripts/config --file out/.config -d LTO_CLANG -d THINLTO -d LTO || true ;;
+            *) : ;;
+          esac
 
           make "${COMMON[@]}" olddefconfig
 
-          grep -q "^# CONFIG_COMPAT_VDSO is not set" out/.config || echo "::warning::COMPAT_VDSO is still enabled (vdso32 link may fail)"
-
+          # Report options that did not survive olddefconfig (missing dependency etc.)
+          for o in $CONFIG_ENABLE; do
+            o="${o#CONFIG_}"
+            grep -Eq "^CONFIG_${o}=[ym]" out/.config || echo "::warning::CONFIG_${o} did not stick after olddefconfig"
+          done
           if [ "$ENABLE_KSU" = "true" ]; then
             for opt in KSU KPROBES KPROBE_EVENTS; do
               grep -q "^CONFIG_${opt}=y" out/.config || { echo "::error::CONFIG_${opt} did not stick after olddefconfig (a dependency is missing)"; exit 1; }
@@ -179,17 +336,17 @@ jobs:
           cd kernel-source
           source ../make_vars.sh
           export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
-          make -j"$(nproc)" "${COMMON[@]}" \
-            CC="ccache clang" \
+          make -j"$(nproc)" "${COMMON[@]}" "${EXTRA[@]}" \
+            CC="$CCWRAP" \
             KCFLAGS="-Wno-error" \
             KBUILD_BUILD_USER="GitHub" KBUILD_BUILD_HOST="Actions" 2>&1 | tee ../build.log
           make "${COMMON[@]}" -s kernelversion > ../kernel_version.txt
 
       - name: Package with AnyKernel3
         run: |
-          BOOT=kernel-source/out/arch/arm64/boot
+          BOOT="kernel-source/out/arch/$ARCH/boot"
           IMG=""
-          for name in Image.gz-dtb Image.lz4-dtb Image-dtb Image.gz Image.lz4 Image; do
+          for name in Image.gz-dtb Image.lz4-dtb Image-dtb Image.gz Image.lz4 Image zImage-dtb zImage; do
             if [ -f "$BOOT/$name" ]; then IMG="$BOOT/$name"; break; fi
           done
           [ -n "$IMG" ] || { echo "Kernel image not found in $BOOT"; ls -la "$BOOT"; exit 1; }
@@ -199,16 +356,21 @@ jobs:
           rm -rf .git .github README.md LICENSE modules patch ramdisk
           cp "../$IMG" .
           HAVE_DTBO=0
-          if [ -f "../$BOOT/dtbo.img" ]; then cp "../$BOOT/dtbo.img" . && HAVE_DTBO=1; fi
+          if [ "$FLASH_DTBO" = "true" ]; then
+            if [ -f "../$BOOT/dtbo.img" ]; then cp "../$BOOT/dtbo.img" . && HAVE_DTBO=1
+            else echo "::warning::FLASH_DTBO set but the tree did not build dtbo.img"; fi
+          fi
           # Separate dtb only needed if the image does not embed it
           if [[ "$IMG" != *-dtb ]] && [ -f "../$BOOT/dts/dtb" ]; then cp "../$BOOT/dts/dtb" .; fi
 
           KVER=$(cat ../kernel_version.txt)
+          DEVCHECK=1
+          [ -z "$(echo "$DEVICE_NAMES" | xargs)" ] && DEVCHECK=0
           {
             echo "### AnyKernel3 Ramdisk Mod Script"
             echo "properties() { '"
             echo "kernel.string=Custom Kernel $KVER"
-            echo "do.devicecheck=1"
+            echo "do.devicecheck=$DEVCHECK"
             echo "do.modules=0"
             echo "do.systemless=0"
             echo "do.cleanup=1"
@@ -216,7 +378,9 @@ jobs:
             i=1
             IFS=',' read -ra DEVS <<< "$DEVICE_NAMES"
             for d in "${DEVS[@]}"; do
-              echo "device.name$i=$(echo "$d" | xargs)"
+              d="$(echo "$d" | xargs)"
+              [ -n "$d" ] || continue
+              echo "device.name$i=$d"
               i=$((i+1))
             done
             echo "supported.versions="
@@ -270,10 +434,11 @@ jobs:
           CAPTION="✅ <b>Kernel build successful</b>
           • Repo: <code>${KERNEL_REPO}</code>
           • Branch: <code>${KERNEL_BRANCH}</code>
+          • Arch: <code>${ARCH}</code>
           • Defconfig: <code>${DEFCONFIG}</code>
           • Version: <code>${KVER}</code>
           • KernelSU: <code>${ENABLE_KSU}</code>
-          • LTO: <code>${ENABLE_LTO}</code>"
+          • LTO: <code>${LTO}</code>"
           curl -sS --fail -F chat_id="$TG_CHAT" -F parse_mode=HTML \
             -F caption="$CAPTION" -F document=@"$ZIP_NAME" \
             "https://api.telegram.org/bot${TG_TOKEN}/sendDocument"
