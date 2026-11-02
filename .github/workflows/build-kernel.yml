@@ -1,32 +1,37 @@
-name: Dynamic Kernel Builder
+name: Kernel Builder
 
 on:
   workflow_dispatch:
     inputs:
       KERNEL_REPO:
-        description: 'Git repository URL of the kernel'
+        description: 'Kernel Git Repository URL'
         required: true
+        type: string
       KERNEL_BRANCH:
-        description: 'Branch to checkout'
+        description: 'Branch to Checkout'
         required: true
         default: 'main'
+        type: string
       DEFCONFIG:
-        description: 'Defconfig name'
+        description: 'Defconfig Name (e.g., vendor_defconfig)'
         required: true
+        type: string
       ENABLE_KSU:
-        description: 'Enable KernelSU flag (true/false)'
-        required: false
-        default: 'false'
+        description: 'Enable KernelSU'
+        required: true
+        default: false
+        type: boolean
       ENABLE_LTO:
-        description: 'Enable LTO flag (true/false)'
-        required: false
-        default: 'true'
+        description: 'Enable LTO / ThinLTO'
+        required: true
+        default: true
+        type: boolean
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout AnyKernel3
+      - name: Checkout AnyKernel3 Zipper
         uses: actions/checkout@v4
         with:
           repository: AnonymousWP/AnyKernel3
@@ -34,42 +39,41 @@ jobs:
 
       - name: Clone Dynamic Kernel Source
         run: |
-          git clone --depth=1 -b ${{ github.event.inputs.KERNEL_BRANCH }} ${{ github.event.inputs.KERNEL_REPO }} kernel-source
+          git clone --depth=1 -b ${{ inputs.KERNEL_BRANCH }} ${{ inputs.KERNEL_REPO }} kernel-source
 
-      - name: Install Build Toolchain & Dependencies
+      - name: Install Toolchain & Dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y \
             build-essential libncurses-dev bison flex libssl-dev bc git wget zip
           git clone --depth=1 https://github.com/llvm/llvm-project.git toolchain/llvm
 
-      - name: Process Flags & Compile Kernel
+      - name: Compile Kernel & Apply Flags
         env:
           ARCH: arm64
           SUBARCH: arm64
-          KBUILD_BUILD_USER: "Automation"
-          KBUILD_BUILD_HOST: "GitHubActions"
+          KBUILD_BUILD_USER: "GitHub"
+          KBUILD_BUILD_HOST: "Actions"
         run: |
           export PATH="${{ github.workspace }}/toolchain/llvm/bin:$PATH"
           cd kernel-source
           mkdir -p out
 
-          # Apply Defconfig
-          make O=out CC=clang ${{ github.event.inputs.DEFCONFIG }}
+          # Apply config
+          make O=out CC=clang ${{ inputs.DEFCONFIG }}
 
-          # Toggle Config Flags dynamically
-          if [ "${{ github.event.inputs.ENABLE_KSU }}" = "true" ]; then
+          # Dynamic Flags Injection
+          if [ "${{ inputs.ENABLE_KSU }}" = "true" ]; then
             echo "Enabling KernelSU..."
             ./scripts/config --file out/.config -e CONFIG_KSU
           else
             ./scripts/config --file out/.config -d CONFIG_KSU
           fi
 
-          if [ "${{ github.event.inputs.ENABLE_LTO }}" = "false" ]; then
+          if [ "${{ inputs.ENABLE_LTO }}" = "false" ]; then
             echo "Disabling LTO..."
             ./scripts/config --file out/.config -d CONFIG_THINLTO -d CONFIG_LTO_CLANG
           fi
 
-          # Update config state
           make O=out CC=clang olddefconfig
 
           # Compile
@@ -80,10 +84,9 @@ jobs:
 
       - name: Package with AnyKernel3
         run: |
-          # Find image format
           IMG=$(find kernel-source/out/arch/arm64/boot/ -name "Image*" -type f | head -n 1)
           if [ -z "$IMG" ]; then
-            echo "Error: No compiled image found!"
+            echo "Error: Kernel image not found!"
             exit 1
           fi
 
@@ -98,8 +101,8 @@ jobs:
           token: ${{ secrets.TELEGRAM_TOKEN }}
           document: flashable-kernel.zip
           caption: |
-            ✅ *Build Complete!*
-            • Source: `${{ github.event.inputs.KERNEL_REPO }}`
-            • Branch: `${{ github.event.inputs.KERNEL_BRANCH }}`
-            • Defconfig: `${{ github.event.inputs.DEFCONFIG }}`
-            • KernelSU: `${{ github.event.inputs.ENABLE_KSU }}`
+            ✅ *Kernel Build Successful!*
+            • Repo: `${{ inputs.KERNEL_REPO }}`
+            • Branch: `${{ inputs.KERNEL_BRANCH }}`
+            • Defconfig: `${{ inputs.DEFCONFIG }}`
+            • KernelSU: `${{ inputs.ENABLE_KSU }}`
