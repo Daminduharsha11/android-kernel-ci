@@ -4,115 +4,254 @@ on:
   workflow_dispatch:
     inputs:
       KERNEL_REPO:
-        description: 'Kernel Git Repository URL'
+        description: 'Kernel Git Repository URL (https)'
         required: true
+        default: 'https://github.com/ximi-mojito/android_kernel_xiaomi_mojito'
         type: string
       KERNEL_BRANCH:
-        description: 'Branch to Checkout'
+        description: 'Branch to checkout'
         required: true
-        default: 'main'
+        default: '17.0'
         type: string
       DEFCONFIG:
-        description: 'Defconfig Name (e.g., defconfig)'
+        description: 'Defconfig name (NOT plain "defconfig", that is generic upstream arm64)'
         required: true
+        default: 'mojito_defconfig'
         type: string
+      DEVICE_NAMES:
+        description: 'Device codenames for the zip check, comma separated'
+        required: true
+        default: 'mojito,sunny'
+        type: string
+      BOOT_BLOCK:
+        description: 'Boot partition block (e.g. /dev/block/bootdevice/by-name/boot)'
+        required: true
+        default: '/dev/block/bootdevice/by-name/boot'
+        type: string
+      IS_SLOT_DEVICE:
+        description: 'A/B device? (auto / 0 / 1)'
+        required: true
+        default: '0'
+        type: choice
+        options: [auto, '0', '1']
       ENABLE_KSU:
-        description: 'Enable KernelSU'
+        description: 'Enable KernelSU (non-GKI setup)'
         required: true
         default: false
         type: boolean
+      KSU_REF:
+        description: 'KernelSU tag/branch for non-GKI kernels'
+        required: true
+        default: 'v0.9.5'
+        type: string
       ENABLE_LTO:
-        description: 'Enable LTO / ThinLTO'
+        description: 'Enable ThinLTO (mojito_defconfig already has LTO+CFI on)'
         required: true
         default: true
         type: boolean
+      CLANG_REPO:
+        description: 'Clang toolchain git repo (must include binutils, e.g. proton-clang)'
+        required: true
+        default: 'https://github.com/kdrag0n/proton-clang'
+        type: string
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # Inputs are passed through env vars and always quoted in scripts,
+    # never pasted directly into shell code (prevents script injection).
+    env:
+      KERNEL_REPO: ${{ inputs.KERNEL_REPO }}
+      KERNEL_BRANCH: ${{ inputs.KERNEL_BRANCH }}
+      DEFCONFIG: ${{ inputs.DEFCONFIG }}
+      DEVICE_NAMES: ${{ inputs.DEVICE_NAMES }}
+      BOOT_BLOCK: ${{ inputs.BOOT_BLOCK }}
+      IS_SLOT_DEVICE: ${{ inputs.IS_SLOT_DEVICE }}
+      ENABLE_KSU: ${{ inputs.ENABLE_KSU }}
+      KSU_REF: ${{ inputs.KSU_REF }}
+      ENABLE_LTO: ${{ inputs.ENABLE_LTO }}
+      CLANG_REPO: ${{ inputs.CLANG_REPO }}
     steps:
-      - name: Checkout AnyKernel3 Zipper
+      - name: Validate inputs
+        run: |
+          case "$KERNEL_REPO" in https://*) ;; *) echo "KERNEL_REPO must be an https URL"; exit 1 ;; esac
+          case "$CLANG_REPO"  in https://*) ;; *) echo "CLANG_REPO must be an https URL"; exit 1 ;; esac
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
+            cpio lz4 zip curl git python3 ccache device-tree-compiler
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: kernel-${{ inputs.DEFCONFIG }}
+          max-size: 2G
+
+      - name: Checkout AnyKernel3
         uses: actions/checkout@v4
         with:
           repository: osm0sis/AnyKernel3
           path: AnyKernel3
 
-      - name: Clone Dynamic Kernel Source
-        run: |
-          git clone --depth=1 -b ${{ inputs.KERNEL_BRANCH }} ${{ inputs.KERNEL_REPO }} kernel-source
+      - name: Clone kernel source
+        run: git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel-source
 
-      - name: Patch Kernel Headers for Modern GCC
+      - name: Clone Clang toolchain
+        run: |
+          git clone --depth=1 "$CLANG_REPO" clang
+          echo "$PWD/clang/bin" >> "$GITHUB_PATH"
+
+      - name: Integrate KernelSU
+        if: ${{ inputs.ENABLE_KSU }}
         run: |
           cd kernel-source
-          find include/ -type f -name "*.h" -exec sed -i 's/#if __has_attribute/#if defined(__has_attribute) \&\& __has_attribute/g' {} +
+          curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "$KSU_REF"
+          test -d KernelSU || { echo "KernelSU setup failed"; exit 1; }
 
-      - name: Install Toolchain & Dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y \
-            build-essential libncurses-dev bison flex libssl-dev bc git wget zip \
-            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            binutils-arm-linux-gnueabi gcc-arm-linux-gnueabi
-
-      - name: Compile Kernel & Apply Flags
-        env:
-          ARCH: arm64
-          SUBARCH: arm64
-          KBUILD_BUILD_USER: "GitHub"
-          KBUILD_BUILD_HOST: "Actions"
+      - name: Configure kernel
         run: |
           cd kernel-source
           mkdir -p out
+          COMMON=(O=out ARCH=arm64 SUBARCH=arm64 CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+                  OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+                  CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- \
+                  CROSS_COMPILE_ARM32=arm-linux-gnueabi-)
+          declare -p COMMON > ../make_vars.sh
 
-          # Apply config
-          make O=out ${{ inputs.DEFCONFIG }}
+          make "${COMMON[@]}" "$DEFCONFIG"
 
-          # Disable KVM to prevent compilation errors on older trees
-          ./scripts/config --file out/.config -d CONFIG_KVM
-          ./scripts/config --file out/.config -d CONFIG_KVM_ARM_HOST
+          # KVM often breaks old trees
+          ./scripts/config --file out/.config -d KVM -d KVM_ARM_HOST || true
 
-          # Dynamic Flags Injection
-          if [ "${{ inputs.ENABLE_KSU }}" = "true" ]; then
-            echo "Enabling KernelSU..."
-            ./scripts/config --file out/.config -e CONFIG_KSU
+          if [ "$ENABLE_KSU" = "true" ]; then
+            # On 4.14, KPROBES depends on MODULES, and mojito_defconfig has MODULES off.
+            ./scripts/config --file out/.config -e MODULES -e KSU -e KPROBES -e HAVE_KPROBES -e KPROBE_EVENTS
           else
-            ./scripts/config --file out/.config -d CONFIG_KSU
+            ./scripts/config --file out/.config -d KSU || true
           fi
 
-          if [ "${{ inputs.ENABLE_LTO }}" = "false" ]; then
-            echo "Disabling LTO..."
-            ./scripts/config --file out/.config -d CONFIG_THINLTO -d CONFIG_LTO_CLANG
+          if [ "$ENABLE_LTO" = "true" ]; then
+            if grep -rqs "config LTO_CLANG" arch init Kconfig* 2>/dev/null; then
+              ./scripts/config --file out/.config -e LTO_CLANG -e THINLTO || true
+            else
+              echo "::warning::This tree has no LTO_CLANG option, skipping LTO"
+            fi
+          else
+            ./scripts/config --file out/.config -d LTO_CLANG -d THINLTO -d LTO || true
           fi
 
-          make O=out olddefconfig
+          make "${COMMON[@]}" olddefconfig
 
-          # Compile using stable GCC toolchains
-          make -j$(nproc) O=out \
-            ARCH=arm64 \
-            SUBARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          if [ "$ENABLE_KSU" = "true" ]; then
+            for opt in KSU KPROBES KPROBE_EVENTS; do
+              grep -q "^CONFIG_${opt}=y" out/.config || { echo "::error::CONFIG_${opt} did not stick after olddefconfig (a dependency is missing)"; exit 1; }
+            done
+          fi
+
+      - name: Compile kernel
+        run: |
+          cd kernel-source
+          source ../make_vars.sh
+          export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
+          make -j"$(nproc)" "${COMMON[@]}" \
+            CC="ccache clang" \
+            KCFLAGS="-Wno-error" \
+            KBUILD_BUILD_USER="GitHub" KBUILD_BUILD_HOST="Actions" 2>&1 | tee ../build.log
+          make "${COMMON[@]}" -s kernelversion > ../kernel_version.txt
 
       - name: Package with AnyKernel3
         run: |
-          IMG=$(find kernel-source/out/arch/arm64/boot/ -name "Image*" -type f | head -n 1)
-          if [ -z "$IMG" ]; then
-            echo "Error: Kernel image not found!"
-            exit 1
-          fi
+          BOOT=kernel-source/out/arch/arm64/boot
+          IMG=""
+          for name in Image.gz-dtb Image.lz4-dtb Image-dtb Image.gz Image.lz4 Image; do
+            if [ -f "$BOOT/$name" ]; then IMG="$BOOT/$name"; break; fi
+          done
+          [ -n "$IMG" ] || { echo "Kernel image not found in $BOOT"; ls -la "$BOOT"; exit 1; }
+          echo "Using image: $IMG"
 
-          cp "$IMG" AnyKernel3/
           cd AnyKernel3
-          zip -r9 ../flashable-kernel.zip *
+          rm -rf .git .github README.md LICENSE modules patch ramdisk
+          cp "../$IMG" .
+          [ -f "../$BOOT/dtbo.img" ] && cp "../$BOOT/dtbo.img" . || true
+          # Separate dtb only needed if the image does not embed it
+          if [[ "$IMG" != *-dtb ]] && [ -f "../$BOOT/dts/dtb" ]; then cp "../$BOOT/dts/dtb" .; fi
 
-      - name: Send Zip to Telegram
-        uses: appleboy/telegram-action@master
+          KVER=$(cat ../kernel_version.txt)
+          {
+            echo "### AnyKernel3 Ramdisk Mod Script"
+            echo "properties() { '"
+            echo "kernel.string=Custom Kernel $KVER"
+            echo "do.devicecheck=1"
+            echo "do.modules=0"
+            echo "do.systemless=0"
+            echo "do.cleanup=1"
+            echo "do.cleanuponabort=0"
+            i=1
+            IFS=',' read -ra DEVS <<< "$DEVICE_NAMES"
+            for d in "${DEVS[@]}"; do
+              echo "device.name$i=$(echo "$d" | xargs)"
+              i=$((i+1))
+            done
+            echo "supported.versions="
+            echo "supported.patchlevels="
+            echo "supported.vendorpatchlevels="
+            echo "'; }"
+            echo "BLOCK=$BOOT_BLOCK;"
+            echo "IS_SLOT_DEVICE=$IS_SLOT_DEVICE;"
+            echo "RAMDISK_COMPRESSION=auto;"
+            echo "PATCH_VBMETA_FLAG=auto;"
+            echo ". tools/ak3-core.sh;"
+            echo "split_boot;"
+            echo "flash_boot;"
+          } > anykernel.sh
+
+          ZIP="Kernel-${KVER}-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "../$ZIP" ./* -x '.git*'
+          echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          to: ${{ secrets.TELEGRAM_CHAT_ID }}
-          token: ${{ secrets.TELEGRAM_TOKEN }}
-          document: flashable-kernel.zip
-          caption: |
-            ✅ *Kernel Build Successful!*
-            • Repo: `${{ inputs.KERNEL_REPO }}`
-            • Branch: `${{ inputs.KERNEL_BRANCH }}`
-            • Defconfig: `${{ inputs.DEFCONFIG }}`
-            • KernelSU: `${{ inputs.ENABLE_KSU }}`
+          name: kernel-build
+          include-hidden-files: true
+          path: |
+            *.zip
+            build.log
+            kernel-source/out/.config
+          if-no-files-found: warn
+
+      - name: Send zip to Telegram
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          KVER=$(cat kernel_version.txt)
+          CAPTION="✅ <b>Kernel build successful</b>
+          • Repo: <code>${KERNEL_REPO}</code>
+          • Branch: <code>${KERNEL_BRANCH}</code>
+          • Defconfig: <code>${DEFCONFIG}</code>
+          • Version: <code>${KVER}</code>
+          • KernelSU: <code>${ENABLE_KSU}</code>
+          • LTO: <code>${ENABLE_LTO}</code>"
+          curl -sS --fail -F chat_id="$TG_CHAT" -F parse_mode=HTML \
+            -F caption="$CAPTION" -F document=@"$ZIP_NAME" \
+            "https://api.telegram.org/bot${TG_TOKEN}/sendDocument"
+
+      - name: Notify failure on Telegram
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          [ -f build.log ] && tail -n 40 build.log > fail_tail.txt || echo "No build log" > fail_tail.txt
+          curl -sS -F chat_id="$TG_CHAT" -F caption="❌ Kernel build failed (last lines of log)" \
+            -F document=@fail_tail.txt "https://api.telegram.org/bot${TG_TOKEN}/sendDocument" || true
