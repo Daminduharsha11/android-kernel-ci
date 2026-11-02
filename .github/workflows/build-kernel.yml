@@ -45,8 +45,8 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y \
             build-essential libncurses-dev bison flex libssl-dev bc git wget zip \
-            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
-          git clone --depth=1 https://github.com/llvm/llvm-project.git toolchain/llvm
+            binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            binutils-arm-linux-gnueabi gcc-arm-linux-gnueabi
 
       - name: Compile Kernel & Apply Flags
         env:
@@ -55,12 +55,11 @@ jobs:
           KBUILD_BUILD_USER: "GitHub"
           KBUILD_BUILD_HOST: "Actions"
         run: |
-          export PATH="${{ github.workspace }}/toolchain/llvm/bin:$PATH"
           cd kernel-source
           mkdir -p out
 
           # Apply config
-          make O=out CC=clang ${{ inputs.DEFCONFIG }}
+          make O=out ${{ inputs.DEFCONFIG }}
 
           # Disable KVM to prevent compilation errors on older trees
           ./scripts/config --file out/.config -d CONFIG_KVM
@@ -79,13 +78,14 @@ jobs:
             ./scripts/config --file out/.config -d CONFIG_THINLTO -d CONFIG_LTO_CLANG
           fi
 
-          make O=out CC=clang olddefconfig
+          make O=out olddefconfig
 
-          # Compile
+          # Compile using stable GCC toolchains
           make -j$(nproc) O=out \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            CROSS_COMPILE=aarch64-linux-gnu-
+            ARCH=arm64 \
+            SUBARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
 
       - name: Package with AnyKernel3
         run: |
